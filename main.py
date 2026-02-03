@@ -8,13 +8,25 @@ class HoneypotState(TypedDict):
     sessionId: str #HoneypotState describes the shape of the dictionary that flows through LangGraph
     turns: int
     is_scam : bool
+    last_message : str
+    conversationHistory : list
 #Langgraph node functions
 
 def ingest(state:HoneypotState) -> HoneypotState: #This function receives the current state and returns the updated state.
     return state
 
 def detect(state:HoneypotState) -> HoneypotState: 
+    #this is a placeholder for actual scam detection logic (do ur job rihan)
+    scam_keywords = ["blocked", "verify", "upi", "account", "urgent", "limited", "click", "link", "password", "login"]
+    text = state.get("last_message", "").lower()
+    state["is_scam"] = any(keyword in text for keyword in scam_keywords)
     return state
+
+def route_after_detect(state:HoneypotState) :
+    if(state["is_scam"]):
+        return "FINAL"
+    else:
+        return "FINAL"
 
 def final(state:HoneypotState) -> HoneypotState:
     return state
@@ -26,7 +38,12 @@ graph_builder.add_node("DETECT", detect)
 graph_builder.add_node("FINAL", final)
 graph_builder.set_entry_point("INGEST")
 graph_builder.add_edge("INGEST", "DETECT")
-graph_builder.add_edge("DETECT", "FINAL")
+graph_builder.add_conditional_edges(
+    "DETECT", 
+    route_after_detect,
+    {
+        "FINAL": "FINAL"
+    })
 graph_builder.add_edge("FINAL", END)
 graph = graph_builder.compile()
 
@@ -40,14 +57,18 @@ def honeypot(payload: Dict[str, Any]):
     if session_id not in sessions:
         sessions[session_id] = {
             "turns": 0,
-            "active": True
+            "active": True,
+            "conversationHistory": []
         }
     sessions[session_id]["turns"] += 1
+    sessions[session_id]["conversationHistory"].append(payload.get("message", {}).get("text", ""))
 
     initial_state: HoneypotState = {
         "sessionId": session_id,
         "turns": sessions[session_id]["turns"],
-        "is_scam": False
+        "is_scam": False,
+        "last_message": payload.get("message", {}).get("text", ""),
+        "conversationHistory": sessions[session_id]["conversationHistory"]
     }
     final_state = graph.invoke(initial_state)
     return{
