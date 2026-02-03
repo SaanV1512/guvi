@@ -7,6 +7,7 @@ sessions = {}
 class HoneypotState(TypedDict):
     sessionId: str #HoneypotState describes the shape of the dictionary that flows through LangGraph
     turns: int
+    is_scam : bool
 #Langgraph node functions
 
 def ingest(state:HoneypotState) -> HoneypotState: #This function receives the current state and returns the updated state.
@@ -23,6 +24,7 @@ graph_builder = StateGraph(HoneypotState)
 graph_builder.add_node("INGEST", ingest)
 graph_builder.add_node("DETECT", detect)
 graph_builder.add_node("FINAL", final)
+graph_builder.set_entry_point("INGEST")
 graph_builder.add_edge("INGEST", "DETECT")
 graph_builder.add_edge("DETECT", "FINAL")
 graph_builder.add_edge("FINAL", END)
@@ -41,8 +43,16 @@ def honeypot(payload: Dict[str, Any]):
             "active": True
         }
     sessions[session_id]["turns"] += 1
+
+    initial_state: HoneypotState = {
+        "sessionId": session_id,
+        "turns": sessions[session_id]["turns"],
+        "is_scam": False
+    }
+    final_state = graph.invoke(initial_state)
     return{
         "status":"received",
-        "sessionId": session_id,
-        "turns": sessions[session_id]["turns"]
+        "sessionId": final_state["sessionId"],
+        "turns": final_state["turns"],
+        "is_scam": final_state["is_scam"]
     }
