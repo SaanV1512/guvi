@@ -1,32 +1,77 @@
 from fastapi import FastAPI
 from typing import Dict, Any, TypedDict
 from langgraph.graph import StateGraph, END
+from intelligence import (
+    detect_scam_with_score,
+    explain_scam_decision,
+    update_intelligence,
+    generate_agent_reply
+)
+
 
 sessions = {}
 #Langgraph state
 class HoneypotState(TypedDict):
-    sessionId: str #HoneypotState describes the shape of the dictionary that flows through LangGraph
+    sessionId: str
     turns: int
-    is_scam : bool
-    last_message : str
-    conversationHistory : list
+    is_scam: bool
+    risk_score: float
+    risk_signals: list
+    last_message: str
+    conversationHistory: list
+    extracted_intel: dict
+    agent_reply: str
+
 #Langgraph node functions
 
 def ingest(state:HoneypotState) -> HoneypotState: #This function receives the current state and returns the updated state.
     return state
 
-def detect(state:HoneypotState) -> HoneypotState: 
-    #this is a placeholder for actual scam detection logic (do ur job rihan)
-    scam_keywords = ["blocked", "verify", "upi", "account", "urgent", "limited", "click", "link", "password", "login"]
-    text = state.get("last_message", "").lower()
-    state["is_scam"] = any(keyword in text for keyword in scam_keywords)
+
+def agent(state: HoneypotState) -> HoneypotState:
+    message = state.get("last_message", "")
+    history = state.get("conversationHistory", [])
+
+    intel_store = state.get("extracted_intel", {})
+    intel_store = update_intelligence(intel_store, message)
+    state["extracted_intel"] = intel_store
+
+    persona_prompt = """
+    You are Rajesh (Only if the scammer hasnt specified a name in the message), a 65-year-old retired clerk.
+    You are worried about your bank account and not tech-savvy.
+    You ask naive questions and want help urgently.
+    You make slight grammatical errors and rarely use punctuation.
+    Never admit you are AI.
+    """
+
+    reply = generate_agent_reply(
+        persona_prompt=persona_prompt,
+        conversation_history=history,
+        latest_message=message,
+        intel_store=intel_store
+    )
+
+    state["agent_reply"] = reply
     return state
 
-def route_after_detect(state:HoneypotState) :
-    if(state["is_scam"]):
-        return "FINAL"
+
+
+def detect(state: HoneypotState) -> HoneypotState:
+    message = state.get("last_message", "")
+    history = state.get("conversationHistory", [])
+    risk, signals = detect_scam_with_score(message, history)
+    state["risk_score"] = risk
+    state["risk_signals"] = signals
+    state["is_scam"] = risk > 0.6
+
+    return state
+
+def route_after_detect(state):
+    if state["is_scam"]:
+        return "AGENT"
     else:
         return "FINAL"
+
 
 def final(state:HoneypotState) -> HoneypotState:
     return state
@@ -35,15 +80,21 @@ def final(state:HoneypotState) -> HoneypotState:
 graph_builder = StateGraph(HoneypotState)
 graph_builder.add_node("INGEST", ingest)
 graph_builder.add_node("DETECT", detect)
+graph_builder.add_node("AGENT", agent)
 graph_builder.add_node("FINAL", final)
 graph_builder.set_entry_point("INGEST")
 graph_builder.add_edge("INGEST", "DETECT")
+graph_builder.add_edge("DETECT", "AGENT")
+graph_builder.add_edge("AGENT", "FINAL")
 graph_builder.add_conditional_edges(
-    "DETECT", 
+    "DETECT",
     route_after_detect,
     {
+        "AGENT": "AGENT",
         "FINAL": "FINAL"
-    })
+    }
+)
+
 graph_builder.add_edge("FINAL", END)
 graph = graph_builder.compile()
 
@@ -58,8 +109,10 @@ def honeypot(payload: Dict[str, Any]):
         sessions[session_id] = {
             "turns": 0,
             "active": True,
-            "conversationHistory": []
+            "conversationHistory": [],
+            "extracted_intel": {}
         }
+
     sessions[session_id]["turns"] += 1
     sessions[session_id]["conversationHistory"].append(payload.get("message", {}).get("text", ""))
 
@@ -67,13 +120,22 @@ def honeypot(payload: Dict[str, Any]):
         "sessionId": session_id,
         "turns": sessions[session_id]["turns"],
         "is_scam": False,
+        "risk_score": 0.0,
+        "risk_signals": [],
         "last_message": payload.get("message", {}).get("text", ""),
-        "conversationHistory": sessions[session_id]["conversationHistory"]
+        "conversationHistory": sessions[session_id]["conversationHistory"],
+        "extracted_intel": sessions[session_id]["extracted_intel"],
+        "agent_reply": ""
     }
+
     final_state = graph.invoke(initial_state)
-    return{
-        "status":"received",
-        "sessionId": final_state["sessionId"],
-        "turns": final_state["turns"],
-        "is_scam": final_state["is_scam"]
+    sessions[session_id]["extracted_intel"] = final_state["extracted_intel"]
+
+    return {
+        "status": "success",
+        "reply": final_state.get("agent_reply", "Okay."),
+        "risk_score": final_state.get("risk_score", 0.0),
+        "signals": final_state.get("risk_signals", []),
+        "extracted_intel": final_state.get("extracted_intel", {})
     }
+
