@@ -113,7 +113,11 @@ def honeypot(payload: Dict[str, Any]):
         }
 
     sessions[session_id]["turns"] += 1
-    sessions[session_id]["conversationHistory"].append(payload.get("message", {}).get("text", ""))
+    sessions[session_id]["conversationHistory"].append({
+    "sender": payload.get("message", {}).get("sender", "scammer"),
+    "text": payload.get("message", {}).get("text", "")
+})
+
 
     initial_state: HoneypotState = {
         "sessionId": session_id,
