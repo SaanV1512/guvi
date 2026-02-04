@@ -27,6 +27,15 @@ class HoneypotState(TypedDict):
 def ingest(state:HoneypotState) -> HoneypotState: #This function receives the current state and returns the updated state.
     return state
 
+def normalize_intelligence(intel_store, risk_signals):
+    return {
+        "bankAccounts": [],  # you can add extraction later if needed
+        "upiIds": intel_store.get("upis", []),
+        "phishingLinks": intel_store.get("urls", []),
+        "phoneNumbers": intel_store.get("phones", []),
+        "suspiciousKeywords": risk_signals
+    }
+
 
 def agent(state: HoneypotState) -> HoneypotState:
     message = state.get("last_message", "")
@@ -134,11 +143,17 @@ def honeypot(payload: Dict[str, Any]):
     final_state = graph.invoke(initial_state)
     sessions[session_id]["extracted_intel"] = final_state["extracted_intel"]
 
+    normalized_intel = normalize_intelligence(
+        final_state.get("extracted_intel", {}),
+        final_state.get("risk_signals", [])
+    )
+
     return {
         "status": "success",
         "reply": final_state.get("agent_reply", "Okay."),
         "risk_score": final_state.get("risk_score", 0.0),
         "signals": final_state.get("risk_signals", []),
-        "extracted_intel": final_state.get("extracted_intel", {})
+        "explanations": explain_scam_decision(final_state.get("risk_signals", [])),
+        "extracted_intel": normalized_intel
     }
 
