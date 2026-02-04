@@ -84,7 +84,6 @@ graph_builder.add_node("AGENT", agent)
 graph_builder.add_node("FINAL", final)
 graph_builder.set_entry_point("INGEST")
 graph_builder.add_edge("INGEST", "DETECT")
-graph_builder.add_edge("DETECT", "AGENT")
 graph_builder.add_edge("AGENT", "FINAL")
 graph_builder.add_conditional_edges(
     "DETECT",
