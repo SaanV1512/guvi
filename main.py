@@ -165,7 +165,7 @@ def send_guvi_callback(session_id: str, final_state: dict):
         )
     }
     try:
-        response = requests.post(GUVI_CALLBACK_URL, json=payload)
+        response = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
     except Exception as e:
         print(f"GUVI callback failed: {e}")
 
@@ -229,7 +229,7 @@ def honeypot(payload: Dict[str, Any]):
 
     return {
         "status": "success",
-        "reply": final_state.get("agent_reply", "Okay."),
+        "reply": reply,
         "risk_score": final_state.get("risk_score", 0.0),
         "signals": final_state.get("risk_signals", []),
         "explanations": explain_scam_decision(final_state.get("risk_signals", [])),
