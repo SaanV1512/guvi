@@ -32,7 +32,7 @@ def ingest(state:HoneypotState) -> HoneypotState: #This function receives the cu
 
 def normalize_intelligence(intel_store, risk_signals):
     return {
-        "bankAccounts": [],  # you can add extraction later if needed
+        "bankAccounts": intel_store.get("bankAccounts", []),
         "upiIds": intel_store.get("upis", []),
         "phishingLinks": intel_store.get("urls", []),
         "phoneNumbers": intel_store.get("phones", []),
@@ -45,17 +45,19 @@ def agent(state: HoneypotState) -> HoneypotState:
     history = state.get("conversationHistory", [])
     intel_store = state.get("extracted_intel", {})
 
-    intel_store = update_intelligence(intel_store, message)
+    intel_store = update_intelligence(intel_store, message, history)
     state["extracted_intel"] = intel_store
 
     state["stage"] = state.get("stage", "probing")
     if(intel_store.get("upis") or intel_store.get("urls") or intel_store.get("phones")):
         state["stage"] = "extracting"
     total_intel = len(intel_store.get("upis", [])) + len(intel_store.get("urls", [])) + len(intel_store.get("phones", []))
-    if total_intel > 3:
+    if (
+    (len(intel_store.get("phones", [])) > 0 and len(intel_store.get("urls", [])) > 0) or
+    (len(intel_store.get("phones", [])) > 0 and len(intel_store.get("upis", [])) > 0) or
+    (len(intel_store.get("bankAccounts", [])) > 0 and len(intel_store.get("phones", [])) > 0)
+):
         state["stage"] = "closing"
-    
-    
 
     stage = state.get("stage", "probing")
     if(stage=="probing"):
@@ -63,15 +65,26 @@ def agent(state: HoneypotState) -> HoneypotState:
     elif(stage=="extracting"):
         stage_behavior = "You are cooperative and trying to follow instructions carefully."
     else:
-        stage_behavior = "You want to delay and safely end the conversation without suspicion."
+        stage_behavior = """
+        You have already gotten enough details.
+        Now disengage naturally like a tired elderly person.
+        Do NOT ask for phone numbers, UPI, links, or OTP again.
+        Politely say you will go to the bank later or ask your son/daughter to help.
+        Keep replies short and stop engaging further.
+        """
+
     
     persona_prompt = f"""
     You are Rajesh (Only if the scammer hasnt specified a name in the message), a 65-year-old retired clerk.
-    You are worried about your bank account and not tech-savvy.
-    You ask naive questions and want help urgently.
+    You are worried about your bank account (or whatever the scammer is trying to scam you about) and not tech-savvy.
+    You act confused and worried, but you NEVER provide OTP, PIN, account numbers, or UPI.
+    You pretend you are slow with phones but again this a chat not a phone call. (Your goal is to extract as much information as possible without revealing you are an AI)
+    Try extracting the scammer's bank account number, UPI ID, phone number, and phishing links without sounding suspicious.
+    You create urgency for the scammer to explain details again.
+    Ask for more information in a way that makes the scammer think you are trying to understand and follow instructions, not that you are trying to extract information.
     You make slight grammatical errors and rarely use punctuation.
     Never admit you are AI.
-    Avoid repeating sensitive details verbatim. If needed, ask the scammer to confirm them.
+    Avoid repeating sensitive details verbatim. If needed, ask the scammer to confirm them but don't keep asking to repeat them again and again.
     Current engagement stage: {stage}
     Behavior guidance: {stage_behavior}
     """
@@ -226,23 +239,30 @@ def honeypot(payload: Dict[str, Any], x_api_key: str = Header(None)):
     f"DEBUG: stage={final_state.get('stage')}, "
     f"finalized={sessions[session_id]['finalized']}"
     )
-
-    if(
-        final_state.get("stage") == "closing"
-        and not sessions[session_id]["finalized"]
-    ):
-        send_guvi_callback(session_id, final_state)
-        sessions[session_id]["finalized"] = True
-
-    if sessions[session_id]["finalized"]:
-        reply = "Okay beta, I will check and get back later."
-    else:
-        reply = final_state.get("agent_reply", "Okay.")
-    
     normalized_intel = normalize_intelligence(
         final_state.get("extracted_intel", {}),
         final_state.get("risk_signals", [])
     )
+
+    reply = final_state.get("agent_reply", "yes pls wait")
+
+    has_artifacts = (
+    len(final_state["extracted_intel"].get("urls", [])) > 0
+    or (
+        len(final_state["extracted_intel"].get("phones", [])) > 0 and
+        len(final_state["extracted_intel"].get("upis", [])) > 0)
+    )
+
+
+    if (
+        final_state.get("stage") == "closing"
+        and not sessions[session_id]["finalized"]
+        and has_artifacts
+    ):
+        send_guvi_callback(session_id, final_state)
+        sessions[session_id]["finalized"] = True
+
+        
     print(f"Session {session_id}: Stage: {final_state.get('stage')}, Risk Score: {final_state.get('risk_score')}, Extracted Intel: {normalized_intel}")
 
     return {
