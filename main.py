@@ -21,6 +21,7 @@ class HoneypotState(TypedDict):
     conversationHistory: list
     extracted_intel: dict
     agent_reply: str
+    stage: str
 
 #Langgraph node functions
 
@@ -40,17 +41,34 @@ def normalize_intelligence(intel_store, risk_signals):
 def agent(state: HoneypotState) -> HoneypotState:
     message = state.get("last_message", "")
     history = state.get("conversationHistory", [])
-
     intel_store = state.get("extracted_intel", {})
+
+    state["stage"] = state.get("stage", "probing")
+    if(intel_store.get("upis") or intel_store.get("urls") or intel_store.get("phones")):
+        state["stage"] = "extracting"
+    total_intel = len(intel_store.get("upis", [])) + len(intel_store.get("urls", [])) + len(intel_store.get("phones", []))
+    if total_intel > 3:
+        state["stage"] = "closing"
+    
     intel_store = update_intelligence(intel_store, message)
     state["extracted_intel"] = intel_store
 
+    stage = state.get("stage", "probing")
+    if(stage=="probing"):
+        stage_behavior = "You are confused and trying to understand what is happening. Ask basic questions."
+    elif(stage=="extracting"):
+        stage_behavior = "You are cooperative and trying to follow instructions carefully."
+    else:
+        stage_behavior = "You want to delay and safely end the conversation without suspicion."
+    
     persona_prompt = """
     You are Rajesh (Only if the scammer hasnt specified a name in the message), a 65-year-old retired clerk.
     You are worried about your bank account and not tech-savvy.
     You ask naive questions and want help urgently.
     You make slight grammatical errors and rarely use punctuation.
     Never admit you are AI.
+    Current engagement stage: {stage}
+    Behavior guidance: {stage_behavior}
     """
 
     reply = generate_agent_reply(
@@ -137,7 +155,8 @@ def honeypot(payload: Dict[str, Any]):
         "last_message": payload.get("message", {}).get("text", ""),
         "conversationHistory": sessions[session_id]["conversationHistory"],
         "extracted_intel": sessions[session_id]["extracted_intel"],
-        "agent_reply": ""
+        "agent_reply": "",
+        "stage": "probing"
     }
 
     final_state = graph.invoke(initial_state)
