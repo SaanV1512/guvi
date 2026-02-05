@@ -73,15 +73,15 @@ def detect_scam_with_score(message: str, history=None):
 def explain_scam_decision(signals):
     return [f"Detected {sig} pattern" for sig in signals]
 
-UPI_REGEX = r'\b[a-zA-Z0-9.\-_]{3,}@(?(?:okhdfcbank|okicici|oksbi|upi|paytm))\b'
+UPI_REGEX = r'\b[a-zA-Z0-9.\-_]{3,}@(okhdfcbank|okicici|oksbi|paytm|ybl|ibl|axl)\b'
 PHONE_REGEX = r'\+91[\-\s]?[6-9]\d{9}|[6-9]\d{9}'
 URL_REGEX = r'https?://\S+|www\.\S+'
 
 def extract_data(message):
     return {
-        "urls": re.finditer(URL_REGEX, message),
+        "urls": re.findall(URL_REGEX, message),
         "phones": re.findall(PHONE_REGEX, message),
-        "upis": re.findall(UPI_REGEX, message),
+        "upis": [m.group(0) for m in re.finditer(UPI_REGEX, message)],
         "otp_requests": bool(re.search(r'\b(otp|code|pin)\b', message, re.IGNORECASE)),
         "urgency": bool(re.search(r'\b(urgent|immediately|now)\b', message, re.IGNORECASE))
     }
