@@ -165,7 +165,14 @@ def send_guvi_callback(session_id: str, final_state: dict):
         )
     }
     try:
-        response = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+        response = requests.post(
+            GUVI_CALLBACK_URL,
+            json=payload,
+            timeout=5
+        )
+        print("✅ GUVI CALLBACK SENT")
+        print("Status:", response.status_code)
+        print("Response:", response.text)
     except Exception as e:
         print(f"GUVI callback failed: {e}")
 
@@ -183,6 +190,7 @@ def honeypot(payload: Dict[str, Any]):
             "finalized": False,
             "conversationHistory": [],
             "extracted_intel": {},
+            "stage": "probing",
             "metadata" : payload.get("metadata", {})
         }
 
@@ -203,11 +211,17 @@ def honeypot(payload: Dict[str, Any]):
         "conversationHistory": sessions[session_id]["conversationHistory"],
         "extracted_intel": sessions[session_id]["extracted_intel"],
         "agent_reply": "",
-        "stage": "probing"
+        "stage": sessions[session_id]["stage"]
     }
 
     final_state = graph.invoke(initial_state)
+    sessions[session_id]["stage"] = final_state.get("stage", "probing")
     sessions[session_id]["extracted_intel"] = final_state["extracted_intel"]
+
+    print(
+    f"DEBUG: stage={final_state.get('stage')}, "
+    f"finalized={sessions[session_id]['finalized']}"
+    )
 
     if(
         final_state.get("stage") == "closing"
