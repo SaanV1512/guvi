@@ -6,7 +6,8 @@ from intelligence import (
     detect_scam_with_score,
     explain_scam_decision,
     update_intelligence,
-    generate_agent_reply
+    generate_agent_reply,
+    llm_scam_judge
 )
 
 
@@ -44,6 +45,9 @@ def agent(state: HoneypotState) -> HoneypotState:
     history = state.get("conversationHistory", [])
     intel_store = state.get("extracted_intel", {})
 
+    intel_store = update_intelligence(intel_store, message)
+    state["extracted_intel"] = intel_store
+
     state["stage"] = state.get("stage", "probing")
     if(intel_store.get("upis") or intel_store.get("urls") or intel_store.get("phones")):
         state["stage"] = "extracting"
@@ -51,8 +55,7 @@ def agent(state: HoneypotState) -> HoneypotState:
     if total_intel > 3:
         state["stage"] = "closing"
     
-    intel_store = update_intelligence(intel_store, message)
-    state["extracted_intel"] = intel_store
+    
 
     stage = state.get("stage", "probing")
     if(stage=="probing"):
@@ -62,12 +65,13 @@ def agent(state: HoneypotState) -> HoneypotState:
     else:
         stage_behavior = "You want to delay and safely end the conversation without suspicion."
     
-    persona_prompt = """
+    persona_prompt = f"""
     You are Rajesh (Only if the scammer hasnt specified a name in the message), a 65-year-old retired clerk.
     You are worried about your bank account and not tech-savvy.
     You ask naive questions and want help urgently.
     You make slight grammatical errors and rarely use punctuation.
     Never admit you are AI.
+    Avoid repeating sensitive details verbatim. If needed, ask the scammer to confirm them.
     Current engagement stage: {stage}
     Behavior guidance: {stage_behavior}
     """
@@ -87,10 +91,28 @@ def agent(state: HoneypotState) -> HoneypotState:
 def detect(state: HoneypotState) -> HoneypotState:
     message = state.get("last_message", "")
     history = state.get("conversationHistory", [])
+
+    # Rule-based detection
     risk, signals = detect_scam_with_score(message, history)
+
+    # Only call LLM judge when rules are unsure (cost + latency control)
+    llm_flag = False
+    if risk < 0.4 and not signals:
+        llm_flag = llm_scam_judge(message)
+
     state["risk_score"] = risk
-    state["risk_signals"] = signals
-    state["is_scam"] = risk > 0.6
+    prev_signals = state.get("risk_signals", [])
+    state["risk_signals"] = list(set(prev_signals + signals))
+
+
+    # Final decision: combine rules + intent signals + LLM semantics
+    state["is_scam"] = (
+        risk >= 0.5
+        or "upi_request" in signals
+        or "credential" in signals
+        or "phishing" in signals
+        or llm_flag
+    )
 
     return state
 
@@ -203,6 +225,7 @@ def honeypot(payload: Dict[str, Any]):
         final_state.get("extracted_intel", {}),
         final_state.get("risk_signals", [])
     )
+    print(f"Session {session_id}: Stage: {final_state.get('stage')}, Risk Score: {final_state.get('risk_score')}, Extracted Intel: {normalized_intel}")
 
     return {
         "status": "success",
