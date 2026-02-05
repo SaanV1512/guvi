@@ -1,16 +1,19 @@
 import re
 import random
 from groq import Groq
+from dotenv import load_dotenv
 import os
 import requests
 
+
+load_dotenv()
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 SCAM_PATTERNS = {
     "urgency": r"\b(urgent|immediately|now|act fast|limited time)\b",
     "threat": r"\b(blocked|suspended|closed|legal action)\b",
     "credential": r"\b(otp|pin|password|cvv|code)\b",
-    "upi_request": r"\bupi\b|\b@\w+",
+    "upi_request": r'\b[a-zA-Z0-9.\-_]{3,}@(okhdfcbank|okicici|oksbi|upi|paytm)\b',
     "phishing": r"https?://\S+|www\.\S+",
 }
 
@@ -22,9 +25,37 @@ WEIGHTS = {
     "phishing": 0.4
 }
 
+def llm_scam_judge(message):
+    prompt = f"""
+    Classify the following message as scam or not-scam.
+    Return only one word: SCAM or NOT_SCAM.
+
+    Message:
+    "{message}"
+    """
+    try:
+        resp = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a scam detection classifier."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.1-8b-instant",
+            temperature=0.0,
+            max_tokens=5
+        )
+        return "SCAM" in resp.choices[0].message.content.upper()
+    except:
+        return False
+
+
 
 def detect_scam_with_score(message: str, history=None):
     text = message.lower()
+
+    if history:
+        history_text = " ".join([m["text"].lower() for m in history])
+        text = history_text + " " + text
+
     score = 0.0
     signals = []
 
@@ -34,7 +65,10 @@ def detect_scam_with_score(message: str, history=None):
             signals.append(key)
 
     score = min(score, 1.0)
-    return score, signals
+    return score, list(set(signals))
+
+
+
 
 def explain_scam_decision(signals):
     return [f"Detected {sig} pattern" for sig in signals]
@@ -72,16 +106,22 @@ def update_intelligence(intel_store: dict, message: str):
 
 
 def call_groq(system_prompt, user_message):
-    chat_completion = groq_client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        model="mistral",
-        temperature=0.7,
-        max_tokens=120
-    )
-    return chat_completion.choices[0].message.content
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            model="llama-3.1-8b-instant",
+            temperature=0.7,
+            max_tokens=120
+        )
+        content = chat_completion.choices[0].message.content
+        return content.strip() if content else "Sir I am not understanding please explain"
+    except Exception as e:
+        print("Groq error:", e)
+        return "Sir my account is blocked what should I do now"
+
 
 
 def generate_agent_reply(persona_prompt, conversation_history, latest_message, intel_store):
