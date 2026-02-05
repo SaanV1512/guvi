@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from typing import Dict, Any, TypedDict
 from langgraph.graph import StateGraph, END
+import requests
 from intelligence import (
     detect_scam_with_score,
     explain_scam_decision,
@@ -124,6 +125,28 @@ graph_builder.add_conditional_edges(
 graph_builder.add_edge("FINAL", END)
 graph = graph_builder.compile()
 
+GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
+
+def send_guvi_callback(session_id: str, final_state: dict):
+    extracted_intel = normalize_intelligence(
+        final_state.get("extracted_intel", {}),
+        final_state.get("risk_signals", [])
+    )
+    payload = {
+        "sessionId": session_id,
+        "scamDetected": final_state.get("is_scam", False),
+        "totalMessagesExchanged": final_state.get("turns", 0),
+        "extractedIntelligence": extracted_intel,
+        "agentNotes": (
+            f"Detected scam using signals {final_state.get('risk_signals',[])}."
+            f"Engagement stage reached: {final_state.get('stage')}"
+        )
+    }
+    try:
+        response = requests.post(GUVI_CALLBACK_URL, json=payload)
+    except Exception as e:
+        print(f"GUVI callback failed: {e}")
+
 #FastAPI app
 app = FastAPI()
 
@@ -135,8 +158,10 @@ def honeypot(payload: Dict[str, Any]):
         sessions[session_id] = {
             "turns": 0,
             "active": True,
+            "finalized": False,
             "conversationHistory": [],
-            "extracted_intel": {}
+            "extracted_intel": {},
+            "metadata" : payload.get("metadata", {})
         }
 
     sessions[session_id]["turns"] += 1
@@ -162,6 +187,18 @@ def honeypot(payload: Dict[str, Any]):
     final_state = graph.invoke(initial_state)
     sessions[session_id]["extracted_intel"] = final_state["extracted_intel"]
 
+    if(
+        final_state.get("stage") == "closing"
+        and not sessions[session_id]["finalized"]
+    ):
+        send_guvi_callback(session_id, final_state)
+        sessions[session_id]["finalized"] = True
+
+    if sessions[session_id]["finalized"]:
+        reply = "Okay beta, I will check and get back later."
+    else:
+        reply = final_state.get("agent_reply", "Okay.")
+    
     normalized_intel = normalize_intelligence(
         final_state.get("extracted_intel", {}),
         final_state.get("risk_signals", [])
