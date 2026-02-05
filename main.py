@@ -177,11 +177,15 @@ def send_guvi_callback(session_id: str, final_state: dict):
         print(f"GUVI callback failed: {e}")
 
 #FastAPI app
+from fastapi import Header, HTTPException
+API_KEY = "guvi-secret-key"
 app = FastAPI()
 
 @app.post("/honeypot")
 
-def honeypot(payload: Dict[str, Any]):
+def honeypot(payload: Dict[str, Any], x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     session_id = payload.get("sessionId")
     if session_id not in sessions:
         sessions[session_id] = {
