@@ -23,7 +23,9 @@ WEIGHTS = {
     "threat": 0.3,
     "credential": 0.3,
     "upi_request": 0.2,
-    "phishing": 0.4
+    "phishing": 0.4,
+     "phone_request": 0.2,
+    "bank_account": 0.2 
 }
 
 def llm_scam_judge(message):
@@ -228,5 +230,3 @@ Rules:
 """
 
     return call_groq(system_prompt, latest_message)
-
-
