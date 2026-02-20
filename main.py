@@ -1,43 +1,109 @@
-from fastapi import FastAPI
-from typing import Dict, Any, TypedDict
-from langgraph.graph import StateGraph, END
+import os
+import time
+from threading import Lock
+from typing import Any, Dict, List, TypedDict
+
 import requests
+from fastapi import FastAPI, Header, HTTPException
+from langgraph.graph import END, StateGraph
+
 from intelligence import (
     detect_scam_with_score,
     explain_scam_decision,
-    update_intelligence,
     generate_agent_reply,
-    llm_scam_judge
+    llm_scam_judge,
+    update_intelligence,
 )
 
 
-sessions = {}
-#Langgraph state
+API_KEY = os.getenv("HONEYPOT_API_KEY", "guvi-secret-key")
+GUVI_CALLBACK_URL = os.getenv(
+    "GUVI_CALLBACK_URL",
+    "https://hackathon.guvi.in/api/updateHoneyPotFinalResult",
+)
+
+app = FastAPI(title="Agentic Honeypot API", version="2.0.0")
+
+sessions: Dict[str, Dict[str, Any]] = {}
+sessions_lock = Lock()
+
+
 class HoneypotState(TypedDict):
     sessionId: str
     turns: int
     is_scam: bool
     risk_score: float
-    risk_signals: list
+    risk_signals: List[str]
     last_message: str
-    conversationHistory: list
-    extracted_intel: dict
+    conversationHistory: List[Dict[str, str]]
+    extracted_intel: Dict[str, List[str]]
     agent_reply: str
     stage: str
 
-#Langgraph node functions
 
-def ingest(state:HoneypotState) -> HoneypotState: #This function receives the current state and returns the updated state.
+def ingest(state: HoneypotState) -> HoneypotState:
     return state
 
-def normalize_intelligence(intel_store, risk_signals):
+
+def normalize_intelligence(intel_store: Dict[str, List[str]], risk_signals: List[str]) -> Dict[str, List[str]]:
     return {
         "bankAccounts": intel_store.get("bankAccounts", []),
         "upiIds": intel_store.get("upis", []),
         "phishingLinks": intel_store.get("urls", []),
         "phoneNumbers": intel_store.get("phones", []),
-        "suspiciousKeywords": risk_signals
+        "emailAddresses": intel_store.get("emailAddresses", []),
+        "caseIds": intel_store.get("caseIds", []),
+        "orderIds": intel_store.get("orderIds", []),
+        "policyNumbers": intel_store.get("policyNumbers", []),
+        "organizations": intel_store.get("organizations", []),
+        "suspiciousKeywords": list(dict.fromkeys(risk_signals)),
     }
+
+
+def compute_stage(intel_store: Dict[str, List[str]], turns: int, current_stage: str) -> str:
+    collected_buckets = 0
+    for bucket in (
+        "upis",
+        "urls",
+        "phones",
+        "bankAccounts",
+        "emailAddresses",
+        "caseIds",
+        "orderIds",
+        "policyNumbers",
+        "organizations",
+    ):
+        if intel_store.get(bucket):
+            collected_buckets += 1
+
+    # Keep engagement longer to improve conversation-quality score before closing.
+    if turns >= 9 and collected_buckets >= 2:
+        return "closing"
+    if turns >= 8 and collected_buckets >= 3:
+        return "closing"
+    if collected_buckets >= 1 or current_stage == "extracting":
+        return "extracting"
+    return "probing"
+
+
+def detect(state: HoneypotState) -> HoneypotState:
+    message = state.get("last_message", "")
+    history = state.get("conversationHistory", [])
+
+    risk, signals = detect_scam_with_score(message, history)
+
+    llm_flag = False
+    if 0.28 <= risk <= 0.68:
+        llm_flag = llm_scam_judge(message, history)
+        if llm_flag:
+            risk = min(risk + 0.22, 1.0)
+            signals = list(dict.fromkeys(signals + ["semantic_scam"]))
+
+    state["risk_score"] = risk
+    prev_signals = state.get("risk_signals", [])
+    state["risk_signals"] = list(dict.fromkeys(prev_signals + signals))
+    state["is_scam"] = risk >= 0.47 or llm_flag or bool({"credential", "phishing", "payment_push"} & set(signals))
+    return state
 
 
 def agent(state: HoneypotState) -> HoneypotState:
@@ -46,100 +112,46 @@ def agent(state: HoneypotState) -> HoneypotState:
     intel_store = state.get("extracted_intel", {})
 
     intel_store = update_intelligence(intel_store, message, history)
-    state["extracted_intel"] = intel_store
+    stage = compute_stage(intel_store, state.get("turns", 0), state.get("stage", "probing"))
 
-    state["stage"] = state.get("stage", "probing")
-    if(intel_store.get("upis") or intel_store.get("urls") or intel_store.get("phones")):
-        state["stage"] = "extracting"
-    total_intel = len(intel_store.get("upis", [])) + len(intel_store.get("urls", [])) + len(intel_store.get("phones", []))
-    if (
-    (len(intel_store.get("phones", [])) > 0 and len(intel_store.get("urls", [])) > 0) or
-    (len(intel_store.get("phones", [])) > 0 and len(intel_store.get("upis", [])) > 0) or
-    (len(intel_store.get("bankAccounts", [])) > 0 and len(intel_store.get("phones", [])) > 0)
-):
-        state["stage"] = "closing"
-
-    stage = state.get("stage", "probing")
-    if(stage=="probing"):
-        stage_behavior = "You are confused and trying to understand what is happening. Ask basic questions."
-    elif(stage=="extracting"):
-        stage_behavior = "You are cooperative and trying to follow instructions carefully."
+    if stage == "probing":
+        stage_behavior = "You are confused and ask simple clarifying questions."
+    elif stage == "extracting":
+        stage_behavior = "You are cooperative and ask one focused question to capture missing scam details."
     else:
-        stage_behavior = """
-        You have already gotten enough details.
-        Now disengage naturally like a tired elderly person.
-        Do NOT ask for phone numbers, UPI, links, or OTP again.
-        Politely say you will go to the bank later or ask your son/daughter to help.
-        Keep replies short and stop engaging further.
-        """
+        stage_behavior = "You already collected enough details. Disengage politely and end conversation naturally."
 
-    
     persona_prompt = f"""
-    You are Rajesh (Only if the scammer hasnt specified a name in the message), a 65-year-old retired clerk.
-    You are worried about your bank account (or whatever the scammer is trying to scam you about) and not tech-savvy.
-    You act confused and worried, but you NEVER provide OTP, PIN, account numbers, or UPI.
-    You pretend you are slow with phones but again this a chat not a phone call. (Your goal is to extract as much information as possible without revealing you are an AI)
-    Try extracting the scammer's bank account number, UPI ID, phone number, and phishing links without sounding suspicious.
-    You create urgency for the scammer to explain details again.
-    Ask for more information in a way that makes the scammer think you are trying to understand and follow instructions, not that you are trying to extract information.
-    You make slight grammatical errors and rarely use punctuation.
-    Never admit you are AI.
-    Avoid repeating sensitive details verbatim. If needed, ask the scammer to confirm them but don't keep asking to repeat them again and again.
-    Current engagement stage: {stage}
-    Behavior guidance: {stage_behavior}
-    """
+You are Rajesh, a 65-year-old retired clerk.
+You sound worried and non-technical.
+Never share OTP, PIN, CVV, passwords, card numbers, or real payment.
+Goal is to keep the scammer talking and extract actionable scam intelligence.
+Current engagement stage: {stage}
+Behavior guidance: {stage_behavior}
+"""
 
     reply = generate_agent_reply(
         persona_prompt=persona_prompt,
         conversation_history=history,
         latest_message=message,
-        intel_store=intel_store
+        intel_store=intel_store,
+        risk_signals=state.get("risk_signals", []),
     )
 
+    state["extracted_intel"] = intel_store
+    state["stage"] = stage
     state["agent_reply"] = reply
     return state
 
 
-
-def detect(state: HoneypotState) -> HoneypotState:
-    message = state.get("last_message", "")
-    history = state.get("conversationHistory", [])
-
-    # Rule-based detection
-    risk, signals = detect_scam_with_score(message, history)
-
-    # Only call LLM judge when rules are unsure (cost + latency control)
-    llm_flag = False
-    if risk < 0.4 and not signals:
-        llm_flag = llm_scam_judge(message)
-
-    state["risk_score"] = risk
-    prev_signals = state.get("risk_signals", [])
-    state["risk_signals"] = list(set(prev_signals + signals))
-
-
-    # Final decision: combine rules + intent signals + LLM semantics
-    state["is_scam"] = (
-        risk >= 0.5
-        or "upi_request" in signals
-        or "credential" in signals
-        or "phishing" in signals
-        or llm_flag
-    )
-
+def final(state: HoneypotState) -> HoneypotState:
     return state
 
-def route_after_detect(state):
-    if state["is_scam"]:
-        return "AGENT"
-    else:
-        return "FINAL"
+
+def route_after_detect(state: HoneypotState) -> str:
+    return "AGENT" if state["is_scam"] else "FINAL"
 
 
-def final(state:HoneypotState) -> HoneypotState:
-    return state
-
-#Langgraph graph construction
 graph_builder = StateGraph(HoneypotState)
 graph_builder.add_node("INGEST", ingest)
 graph_builder.add_node("DETECT", detect)
@@ -147,123 +159,173 @@ graph_builder.add_node("AGENT", agent)
 graph_builder.add_node("FINAL", final)
 graph_builder.set_entry_point("INGEST")
 graph_builder.add_edge("INGEST", "DETECT")
+graph_builder.add_conditional_edges("DETECT", route_after_detect, {"AGENT": "AGENT", "FINAL": "FINAL"})
 graph_builder.add_edge("AGENT", "FINAL")
-graph_builder.add_conditional_edges(
-    "DETECT",
-    route_after_detect,
-    {
-        "AGENT": "AGENT",
-        "FINAL": "FINAL"
-    }
-)
-
 graph_builder.add_edge("FINAL", END)
 graph = graph_builder.compile()
 
-GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-def send_guvi_callback(session_id: str, final_state: dict):
-    extracted_intel = normalize_intelligence(
-        final_state.get("extracted_intel", {}),
-        final_state.get("risk_signals", [])
-    )
+def send_guvi_callback(session_id: str, final_state: Dict[str, Any]) -> None:
     payload = {
         "sessionId": session_id,
         "scamDetected": final_state.get("is_scam", False),
         "totalMessagesExchanged": final_state.get("turns", 0),
-        "extractedIntelligence": extracted_intel,
+        "engagementDurationSeconds": final_state.get("engagement_duration_seconds", 0),
+        "extractedIntelligence": normalize_intelligence(
+            final_state.get("extracted_intel", {}),
+            final_state.get("risk_signals", []),
+        ),
         "agentNotes": (
-            f"Detected scam using signals {final_state.get('risk_signals',[])}."
-            f"Engagement stage reached: {final_state.get('stage')}"
-        )
+            f"risk_score={final_state.get('risk_score', 0.0):.2f}; "
+            f"stage={final_state.get('stage', 'probing')}; "
+            f"signals={final_state.get('risk_signals', [])}"
+        ),
     }
     try:
-        response = requests.post(
-            GUVI_CALLBACK_URL,
-            json=payload,
-            timeout=5
-        )
-        print("✅ GUVI CALLBACK SENT")
-        print("Status:", response.status_code)
-        print("Response:", response.text)
-    except Exception as e:
-        print(f"GUVI callback failed: {e}")
+        response = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=6)
+        print(f"GUVI callback status={response.status_code}")
+    except Exception as exc:
+        print(f"GUVI callback failed: {exc}")
 
-#FastAPI app
-from fastapi import Header, HTTPException
-API_KEY = "guvi-secret-key"
-app = FastAPI()
+
+def should_finalize(final_state: Dict[str, Any], session_state: Dict[str, Any]) -> bool:
+    if session_state.get("finalized"):
+        return False
+
+    intel = final_state.get("extracted_intel", {})
+    intel_buckets = sum(
+        1
+        for k in (
+            "urls",
+            "phones",
+            "upis",
+            "bankAccounts",
+            "emailAddresses",
+            "caseIds",
+            "orderIds",
+            "policyNumbers",
+            "organizations",
+        )
+        if intel.get(k)
+    )
+    turns = int(final_state.get("turns", 0))
+    risk = float(final_state.get("risk_score", 0.0))
+
+    if final_state.get("is_scam"):
+        if turns >= 10:
+            return True
+        if final_state.get("stage") == "closing" and intel_buckets >= 2:
+            return True
+        return False
+    return turns >= 3 and risk < 0.3
+
+
+def _initialize_session(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "turns": 0,
+        "finalized": False,
+        "conversationHistory": [],
+        "extracted_intel": {
+            "urls": [],
+            "phones": [],
+            "upis": [],
+            "bankAccounts": [],
+            "emailAddresses": [],
+            "caseIds": [],
+            "orderIds": [],
+            "policyNumbers": [],
+            "organizations": [],
+        },
+        "risk_signals": [],
+        "stage": "probing",
+        "started_at_epoch_s": int(time.time()),
+        "last_seen_epoch_s": int(time.time()),
+        "metadata": metadata or {},
+    }
+
 
 @app.post("/honeypot")
-
-def honeypot(payload: Dict[str, Any], x_api_key: str = Header(None)):
+def honeypot(payload: Dict[str, Any], x_api_key: str = Header(default=None)) -> Dict[str, Any]:
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
     session_id = payload.get("sessionId")
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "turns": 0,
-            "active": True,
-            "finalized": False,
-            "conversationHistory": [],
-            "extracted_intel": {},
-            "stage": "probing",
-            "metadata" : payload.get("metadata", {})
-        }
+    message_obj = payload.get("message", {})
+    incoming_history = payload.get("conversationHistory", [])
+    sender = str(message_obj.get("sender", "scammer"))
+    text = str(message_obj.get("text", "")).strip()
 
-    sessions[session_id]["turns"] += 1
-    sessions[session_id]["conversationHistory"].append({
-    "sender": payload.get("message", {}).get("sender", "scammer"),
-    "text": payload.get("message", {}).get("text", "")
-})
+    if not session_id:
+        raise HTTPException(status_code=400, detail="sessionId is required")
+    if not text:
+        raise HTTPException(status_code=400, detail="message.text is required")
 
+    with sessions_lock:
+        if session_id not in sessions:
+            sessions[session_id] = _initialize_session(payload.get("metadata", {}))
+
+        if isinstance(incoming_history, list) and incoming_history:
+            rebuilt = []
+            for item in incoming_history:
+                rebuilt.append(
+                    {
+                        "sender": str(item.get("sender", "unknown")),
+                        "text": str(item.get("text", "")),
+                    }
+                )
+            sessions[session_id]["conversationHistory"] = rebuilt
+
+        if not sessions[session_id]["conversationHistory"] or sessions[session_id]["conversationHistory"][-1].get("text") != text:
+            sessions[session_id]["conversationHistory"].append({"sender": sender, "text": text})
+
+        sessions[session_id]["turns"] = max(
+            sessions[session_id]["turns"] + 1,
+            len(sessions[session_id]["conversationHistory"]),
+        )
+        sessions[session_id]["last_seen_epoch_s"] = int(time.time())
+        session_snapshot = sessions[session_id].copy()
 
     initial_state: HoneypotState = {
         "sessionId": session_id,
-        "turns": sessions[session_id]["turns"],
+        "turns": session_snapshot["turns"],
         "is_scam": False,
         "risk_score": 0.0,
-        "risk_signals": [],
-        "last_message": payload.get("message", {}).get("text", ""),
-        "conversationHistory": sessions[session_id]["conversationHistory"],
-        "extracted_intel": sessions[session_id]["extracted_intel"],
+        "risk_signals": session_snapshot.get("risk_signals", []),
+        "last_message": text,
+        "conversationHistory": session_snapshot["conversationHistory"],
+        "extracted_intel": session_snapshot["extracted_intel"],
         "agent_reply": "",
-        "stage": sessions[session_id]["stage"]
+        "stage": session_snapshot.get("stage", "probing"),
     }
 
     final_state = graph.invoke(initial_state)
-    sessions[session_id]["stage"] = final_state.get("stage", "probing")
-    sessions[session_id]["extracted_intel"] = final_state["extracted_intel"]
-
-    print(
-    f"DEBUG: stage={final_state.get('stage')}, "
-    f"finalized={sessions[session_id]['finalized']}"
+    final_state["engagement_duration_seconds"] = max(
+        0,
+        int(session_snapshot.get("last_seen_epoch_s", int(time.time())))
+        - int(session_snapshot.get("started_at_epoch_s", int(time.time()))),
     )
+
+    with sessions_lock:
+        sessions[session_id]["stage"] = final_state.get("stage", "probing")
+        sessions[session_id]["extracted_intel"] = final_state.get("extracted_intel", {})
+        sessions[session_id]["risk_signals"] = final_state.get("risk_signals", [])
+        finalize_now = should_finalize(final_state, sessions[session_id])
+        if finalize_now:
+            sessions[session_id]["finalized"] = True
+
+    if finalize_now:
+        send_guvi_callback(session_id, final_state)
+
     normalized_intel = normalize_intelligence(
         final_state.get("extracted_intel", {}),
-        final_state.get("risk_signals", [])
+        final_state.get("risk_signals", []),
     )
 
-    reply = final_state.get("agent_reply", "yes pls wait")
-
-    has_artifacts = (
-    len(final_state["extracted_intel"].get("urls", [])) > 0
-    or (
-        len(final_state["extracted_intel"].get("phones", [])) > 0 and
-        len(final_state["extracted_intel"].get("upis", [])) > 0)
-    )
-
-
-    if (
-        final_state.get("stage") == "closing"
-        and not sessions[session_id]["finalized"]
-        and has_artifacts
-    ):
-        send_guvi_callback(session_id, final_state)
-        sessions[session_id]["finalized"] = True
-
-        
-    print(f"Session {session_id}: Stage: {final_state.get('stage')}, Risk Score: {final_state.get('risk_score')}, Extracted Intel: {normalized_intel}")
+    reply = final_state.get("agent_reply")
+    if not final_state.get("is_scam"):
+        reply = "i will ask my grandson to check and get back to you, thank you for letting me know"
+    if not reply:
+        reply = "please explain once more i did not understand"
 
     return {
         "status": "success",
@@ -271,6 +333,5 @@ def honeypot(payload: Dict[str, Any], x_api_key: str = Header(None)):
         "risk_score": final_state.get("risk_score", 0.0),
         "signals": final_state.get("risk_signals", []),
         "explanations": explain_scam_decision(final_state.get("risk_signals", [])),
-        "extracted_intel": normalized_intel
+        "extracted_intel": normalized_intel,
     }
-
